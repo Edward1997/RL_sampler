@@ -1,7 +1,9 @@
 import dgl
 from dgl.data import CoraGraphDataset, CiteseerGraphDataset, PubmedGraphDataset
 import torch
+import numpy as np
 
-# g = dgl.graph(torch.tensor([1]), torch.tensor([2]))
-g = dgl.graph(([1], []))
-print(g)
+x = [12,12,12]
+y = [13,13,13]
+
+print(x+y)

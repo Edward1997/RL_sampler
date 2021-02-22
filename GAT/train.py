@@ -45,6 +45,10 @@ def main(args):
     num_feats = features.shape[1]
     n_classes = data.num_labels
     n_edges = data.graph.number_of_edges()
+
+    x = g.nodes().cpu()
+    print(len(x.numpy()))
+    x = input()
     print("""----Data statistics------'
       #Edges %d
       #Classes %d

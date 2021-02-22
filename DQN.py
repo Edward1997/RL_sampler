@@ -25,12 +25,20 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 Transition = namedtuple('Transition',
                         ('state', 'action', 'next_state', 'reward'))
 class myenv():
-    def __init__(self, GAT_model, embedding_model, dataset):
-        self.GAT = torch.load(GAT_model)
+    def __init__(self, GNN_model, embedding_model, dataset):
+        self.GNN = torch.load(GNN_model)
         self.embedding_model = torch.load(embedding_model)
         self.dataset = dataset
-        self.graph =
+        self.picked_nodes = np.random.choice(self.dataset.nodes().numpy(), 1).tolist()
+        self.graph = dgl.node_subgraph(self.dataset, self.picked_nodes)
     def reset(self):
+        self.picked_nodes = np.random.choice(self.dataset.nodes().numpy(), 1).tolist()
+        self.graph = dgl.node_subgraph(self.dataset, self.picked_nodes)
+    def step(self, pick_nodes, kick_nodes):
+        self.picked_nodes = list(set(self.picked_nodes + pick_nodes))
+        self.picked_nodes = [x for x in self.picked_nodes if x not in kick_nodes]
+        self.graph = dgl.node_subgraph(self.dataset, self.picked_nodes)
+
 
 
 class ReplayMemory(object):
