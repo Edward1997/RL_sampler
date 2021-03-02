@@ -47,7 +47,8 @@ def main(args):
     n_edges = data.graph.number_of_edges()
 
     x = g.nodes().cpu()
-    print(len(x.numpy()))
+    print(features)
+    print(g)
     x = input()
     print("""----Data statistics------'
       #Edges %d

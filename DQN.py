@@ -4,6 +4,7 @@ import numpy as np
 from collections import namedtuple
 from itertools import count
 from PIL import Image
+import argparse
 
 import torch
 import torch.nn as nn
@@ -13,36 +14,54 @@ import torchvision.transforms as T
 
 import dgl
 from dgl.data import register_data_args
-from dgl.data import CoraGraphDataset, CiteseerGraphDataset, PubmedGraphDataset
+from dgl.data import CoraGraphDataset
+
+from karateclub.node_embedding.attributed import TENE
+from GAT.model import GAT
 
 
 
-env = myenv()
-
-# if gpu is to be used
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-Transition = namedtuple('Transition',
-                        ('state', 'action', 'next_state', 'reward'))
 class myenv():
     def __init__(self, GNN_model, embedding_model, dataset):
-        self.GNN = torch.load(GNN_model)
-        self.embedding_model = torch.load(embedding_model)
+        self.GNN = GNN_model
+        self.embedding_model = embedding_model
         self.dataset = dataset
-        self.picked_nodes = np.random.choice(self.dataset.nodes().numpy(), 1).tolist()
+        self.picked_nodes = list(set(np.random.choice(dataset.nodes().numpy(), 1)))
         self.graph = dgl.node_subgraph(self.dataset, self.picked_nodes)
+        self.done = False
+
     def reset(self):
-        self.picked_nodes = np.random.choice(self.dataset.nodes().numpy(), 1).tolist()
+        self.picked_nodes = list(set(np.random.choice(dataset.nodes().numpy(), 1)))
         self.graph = dgl.node_subgraph(self.dataset, self.picked_nodes)
-    def step(self, pick_nodes, kick_nodes):
+
+    def state(self):
+        features = torch.stack([x for i, x in enumerate(self.dataset.ndata['feat']) if i in self.picked_nodes])
+        features = np.array(features)
+        graph = dgl.add_self_loop(self.graph)
+        graph = dgl.to_networkx(graph).to_undirected()
+        self.embedding_model.fit(graph, features)
+        embedding = self.embedding_model.get_embedding()
+        embedding = np.sum(embedding, axis=0)
+        return embedding
+
+    def step(self, pick_nodes, kick_nodes=[]):
         self.picked_nodes = list(set(self.picked_nodes + pick_nodes))
         self.picked_nodes = [x for x in self.picked_nodes if x not in kick_nodes]
         self.graph = dgl.node_subgraph(self.dataset, self.picked_nodes)
+        features = torch.stack([x for i, x in enumerate(self.dataset.ndata['feat']) if i in self.picked_nodes])
+        labels = torch.stack([x for i, x in enumerate(self.dataset.ndata['label']) if i in self.picked_nodes])
+        loss_fcn = torch.nn.CrossEntropyLoss()
 
+        logits = self.GNN(self.graph, features)
+        loss = loss_fcn(logits, labels)
+
+        if len(self.picked_nodes) >= 2000:
+            self.done = True
+
+        return -loss, self.done
 
 
 class ReplayMemory(object):
-
     def __init__(self, capacity):
         self.capacity = capacity
         self.memory = []
@@ -61,39 +80,99 @@ class ReplayMemory(object):
     def __len__(self):
         return len(self.memory)
 
-class DQN(nn.Module):
 
-    def __init__(self, h, w, outputs):
+class DQN(nn.Module):
+    def __init__(self, embedding_size, outputs):
         super(DQN, self).__init__()
-        self.conv1 = nn.Conv2d(3, 16, kernel_size=5, stride=2)
-        self.bn1 = nn.BatchNorm2d(16)
-        self.conv2 = nn.Conv2d(16, 32, kernel_size=5, stride=2)
-        self.bn2 = nn.BatchNorm2d(32)
-        self.conv3 = nn.Conv2d(32, 32, kernel_size=5, stride=2)
-        self.bn3 = nn.BatchNorm2d(32)
+        self.conv1 = nn.Conv1d(1, 16, kernel_size=5, stride=1)
+        self.bn1 = nn.BatchNorm1d(16)
+        self.conv2 = nn.Conv1d(16, 32, kernel_size=5, stride=1)
+        self.bn2 = nn.BatchNorm1d(32)
+        self.conv3 = nn.Conv1d(32, 32, kernel_size=5, stride=1)
+        self.bn3 = nn.BatchNorm1d(32)
 
         # Number of Linear input connections depends on output of conv2d layers
         # and therefore the input image size, so compute it.
-        def conv2d_size_out(size, kernel_size = 5, stride = 2):
-            return (size - (kernel_size - 1) - 1) // stride  + 1
-        convw = conv2d_size_out(conv2d_size_out(conv2d_size_out(w)))
-        convh = conv2d_size_out(conv2d_size_out(conv2d_size_out(h)))
-        linear_input_size = convw * convh * 32
+        def conv1d_size_out(size, kernel_size=5, stride=1):
+            return (size - (kernel_size - 1) - 1) // stride + 1
+        conv_size = conv1d_size_out(conv1d_size_out(conv1d_size_out(embedding_size)))
+        linear_input_size = conv_size * 32
         self.head = nn.Linear(linear_input_size, outputs)
 
     # Called with either one element to determine next action, or a batch
     # during optimization. Returns tensor([[left0exp,right0exp]...]).
     def forward(self, x):
+        print(x.shape)
         x = F.relu(self.bn1(self.conv1(x)))
+        print(x.shape)
         x = F.relu(self.bn2(self.conv2(x)))
+        print(x.shape)
         x = F.relu(self.bn3(self.conv3(x)))
+        print(x.shape)
         return self.head(x.view(x.size(0), -1))
 
-resize = T.Compose([T.ToPILImage(),
-                    T.Resize(40, interpolation=Image.CUBIC),
-                    T.ToTensor()])
+parser = argparse.ArgumentParser(description='GAT')
+parser.add_argument("--gpu", type=int, default=0,
+                        help="which GPU to use. Set -1 to use CPU.")
+parser.add_argument("--epochs", type=int, default=500,
+                    help="number of training epochs")
+parser.add_argument("--num-heads", type=int, default=8,
+                    help="number of hidden attention heads")
+parser.add_argument("--num-out-heads", type=int, default=1,
+                    help="number of output attention heads")
+parser.add_argument("--num-layers", type=int, default=1,
+                    help="number of hidden layers")
+parser.add_argument("--num-hidden", type=int, default=8,
+                    help="number of hidden units")
+parser.add_argument("--residual", action="store_true", default=False,
+                    help="use residual connection")
+parser.add_argument("--in-drop", type=float, default=.6,
+                    help="input feature dropout")
+parser.add_argument("--attn-drop", type=float, default=.6,
+                    help="attention dropout")
+parser.add_argument("--lr", type=float, default=0.005,
+                    help="learning rate")
+parser.add_argument('--weight-decay', type=float, default=5e-4,
+                    help="weight decay")
+parser.add_argument('--negative-slope', type=float, default=0.2,
+                    help="the negative slope of leaky relu")
+parser.add_argument('--early-stop', action='store_true', default=True,
+                    help="indicates whether to use early stop or not")
+parser.add_argument('--fastmode', action="store_true", default=False,
+                    help="skip re-evaluate the validation set")
+args = parser.parse_args()
 
+
+data = CoraGraphDataset()
+dataset = data[0]
+dataset = dgl.add_self_loop(dataset)
+
+embedding_model = TENE()
+embedding_model.fit(dgl.to_networkx(dataset).to_undirected(), np.array(dataset.ndata['feat']))
+dataset_embedding = embedding_model.get_embedding()
+dataset_embedding = np.sum(dataset_embedding, axis=0)
+
+heads = ([args.num_heads] * args.num_layers) + [args.num_out_heads]
+GNN_model = GAT(args.num_layers,
+            dataset.ndata['feat'].shape[1],
+            args.num_hidden,
+            data.num_labels,
+            heads,
+            F.elu,
+            args.in_drop,
+            args.attn_drop,
+            args.negative_slope,
+            args.residual)
+GNN_model.load_state_dict(torch.load('GAT/es_checkpoint.pt'))
+
+env = myenv(GNN_model, embedding_model, dataset)
 env.reset()
+
+# if gpu is to be used
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+Transition = namedtuple('Transition',
+                        ('state', 'action', 'next_state', 'reward'))
 
 BATCH_SIZE = 128
 GAMMA = 0.999
@@ -104,10 +183,11 @@ TARGET_UPDATE = 10
 
 
 # Get number of actions from gym action space
-n_actions = env.action_space.n
+n_actions = len(dataset.nodes().numpy())
+embedding_size = 4000
 
-policy_net = DQN(screen_height, screen_width, n_actions).to(device)
-target_net = DQN(screen_height, screen_width, n_actions).to(device)
+policy_net = DQN(embedding_size*2, n_actions).to(device)
+target_net = DQN(embedding_size*2, n_actions).to(device)
 target_net.load_state_dict(policy_net.state_dict())
 target_net.eval()
 
@@ -125,12 +205,13 @@ def select_action(state):
     steps_done += 1
     if sample > eps_threshold:
         with torch.no_grad():
-            # t.max(1) will return largest column value of each row.
-            # second column on max result is index of where max element was
-            # found, so we pick action with the larger expected reward.
-            return policy_net(state).max(1)[1].view(1, 1)
+            pred = policy_net(state)
+            values, indices = pred.topk(3)
+            picked_noeds = list(indices)
+            return picked_noeds
     else:
-        return torch.tensor([[random.randrange(n_actions)]], device=device, dtype=torch.long)
+        return list(set(np.random.choice(n_actions, 3)))
+
 
 def optimize_model():
     if len(memory) < BATCH_SIZE:
@@ -181,20 +262,27 @@ num_episodes = 50
 for i_episode in range(num_episodes):
     # Initialize the environment and state
     env.reset()
-    state = current_screen - last_screen
+    state = np.concatenate((dataset_embedding, env.state()), axis=0)
+    state = torch.from_numpy(state)
+    state = state.view(state.shape[0], 1, 1)
+    print("Round " + str(i_episode))
     for t in count():
+        print("Count " + str(t))
         # Select and perform an action
-        action = select_action(state)
-        _, reward, done, _ = env.step(action.item())
+        pick_nodes = select_action(state)
+
+        reward, done = env.step(pick_nodes)
         reward = torch.tensor([reward], device=device)
 
         if not done:
-            next_state = current_screen - last_screen
+            next_state = np.concatenate((dataset_embedding, env.state()), axis=0)
+            next_state = torch.from_numpy(next_state)
+            next_state = next_state.view(next_state.shape[0], 1, 1)
         else:
             next_state = None
 
         # Store the transition in memory
-        memory.push(state, action, next_state, reward)
+        memory.push(state, pick_nodes, next_state, reward)
 
         # Move to the next state
         state = next_state
@@ -206,5 +294,3 @@ for i_episode in range(num_episodes):
         target_net.load_state_dict(policy_net.state_dict())
 
 print('Complete')
-env.render()
-env.close()
