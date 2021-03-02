@@ -45,7 +45,7 @@ class myenv():
         return embedding
 
     def step(self, pick_nodes, kick_nodes=[]):
-        self.picked_nodes = list(set(self.picked_nodes + pick_nodes))
+        self.picked_nodes = list(set(self.picked_nodes + pick_nodes.tolist()))
         self.picked_nodes = [x for x in self.picked_nodes if x not in kick_nodes]
         self.graph = dgl.node_subgraph(self.dataset, self.picked_nodes)
         features = torch.stack([x for i, x in enumerate(self.dataset.ndata['feat']) if i in self.picked_nodes])
@@ -84,31 +84,28 @@ class ReplayMemory(object):
 class DQN(nn.Module):
     def __init__(self, embedding_size, outputs):
         super(DQN, self).__init__()
-        self.conv1 = nn.Conv1d(1, 16, kernel_size=5, stride=1)
+        self.conv1 = nn.Conv1d(1, 16, kernel_size=5, stride=2)
         self.bn1 = nn.BatchNorm1d(16)
-        self.conv2 = nn.Conv1d(16, 32, kernel_size=5, stride=1)
+        self.conv2 = nn.Conv1d(16, 32, kernel_size=5, stride=2)
         self.bn2 = nn.BatchNorm1d(32)
-        self.conv3 = nn.Conv1d(32, 32, kernel_size=5, stride=1)
+        self.conv3 = nn.Conv1d(32, 32, kernel_size=5, stride=2)
         self.bn3 = nn.BatchNorm1d(32)
 
         # Number of Linear input connections depends on output of conv2d layers
         # and therefore the input image size, so compute it.
-        def conv1d_size_out(size, kernel_size=5, stride=1):
+        def conv1d_size_out(size, kernel_size=5, stride=2):
             return (size - (kernel_size - 1) - 1) // stride + 1
         conv_size = conv1d_size_out(conv1d_size_out(conv1d_size_out(embedding_size)))
         linear_input_size = conv_size * 32
         self.head = nn.Linear(linear_input_size, outputs)
 
+
     # Called with either one element to determine next action, or a batch
     # during optimization. Returns tensor([[left0exp,right0exp]...]).
     def forward(self, x):
-        print(x.shape)
         x = F.relu(self.bn1(self.conv1(x)))
-        print(x.shape)
         x = F.relu(self.bn2(self.conv2(x)))
-        print(x.shape)
         x = F.relu(self.bn3(self.conv3(x)))
-        print(x.shape)
         return self.head(x.view(x.size(0), -1))
 
 parser = argparse.ArgumentParser(description='GAT')
@@ -184,7 +181,7 @@ TARGET_UPDATE = 10
 
 # Get number of actions from gym action space
 n_actions = len(dataset.nodes().numpy())
-embedding_size = 4000
+embedding_size = 64
 
 policy_net = DQN(embedding_size*2, n_actions).to(device)
 target_net = DQN(embedding_size*2, n_actions).to(device)
@@ -207,10 +204,13 @@ def select_action(state):
         with torch.no_grad():
             pred = policy_net(state)
             values, indices = pred.topk(3)
-            picked_noeds = list(indices)
-            return picked_noeds
+            picked_nodes = indices[0].tolist()
+            return torch.tensor(picked_nodes, device=device, dtype=torch.long)
     else:
-        return list(set(np.random.choice(n_actions, 3)))
+        picked_nodes = set(np.random.choice(n_actions, 3))
+        while len(picked_nodes) < 3:
+            picked_nodes.add(np.random.choice(n_actions, 1))
+        return torch.tensor(list(picked_nodes), device=device, dtype=torch.long)
 
 
 def optimize_model():
@@ -235,6 +235,8 @@ def optimize_model():
     # Compute Q(s_t, a) - the model computes Q(s_t), then we select the
     # columns of actions taken. These are the actions which would've been taken
     # for each batch state according to policy_net
+    print(policy_net(state_batch))
+    print(action_batch)
     state_action_values = policy_net(state_batch).gather(1, action_batch)
 
     # Compute V(s_{t+1}) for all next states.
@@ -243,7 +245,9 @@ def optimize_model():
     # This is merged based on the mask, such that we'll have either the expected
     # state value or 0 in case the state was final.
     next_state_values = torch.zeros(BATCH_SIZE, device=device)
-    next_state_values[non_final_mask] = target_net(non_final_next_states).max(1)[0].detach()
+    next_state_values[non_final_mask] = target_net(non_final_next_states).topk(3)[0].detach()
+    print("next_state_values")
+    print(next_state_values)
     # Compute the expected Q values
     expected_state_action_values = (next_state_values * GAMMA) + reward_batch
 
@@ -264,10 +268,12 @@ for i_episode in range(num_episodes):
     env.reset()
     state = np.concatenate((dataset_embedding, env.state()), axis=0)
     state = torch.from_numpy(state)
-    state = state.view(state.shape[0], 1, 1)
+    state = state.type(torch.FloatTensor)
+    state = state.view(1, 1, state.shape[0]).to(device)
     print("Round " + str(i_episode))
     for t in count():
-        print("Count " + str(t))
+        if t%10 == 0:
+            print("Count " + str(t))
         # Select and perform an action
         pick_nodes = select_action(state)
 
@@ -277,7 +283,8 @@ for i_episode in range(num_episodes):
         if not done:
             next_state = np.concatenate((dataset_embedding, env.state()), axis=0)
             next_state = torch.from_numpy(next_state)
-            next_state = next_state.view(next_state.shape[0], 1, 1)
+            next_state = next_state.type(torch.FloatTensor)
+            next_state = next_state.view(1, 1, next_state.shape[0]).to(device)
         else:
             next_state = None
 
